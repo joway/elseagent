@@ -1,0 +1,39 @@
+{
+  "name": "elseagent",
+  "version": "1.0.0",
+  "description": "A personal assistant agent over Telegram, powered by Claude",
+  "type": "module",
+  "bin": {
+    "elseagent": "bin/elseagent.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "AGENTS.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["agent", "telegram", "claude", "anthropic", "ai"],
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@xenova/transformers": "^2.17.2",
+    "node-cron": "^4.2.1",
+    "dotenv": "^16.0.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

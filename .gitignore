@@ -1,0 +1,12 @@
+node_modules/
+dist/
+
+# 敏感配置
+.env
+
+# 运行时数据
+workspace/
+
+# 系统文件
+.DS_Store
+*.tsbuildinfo

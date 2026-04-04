@@ -1,0 +1,17 @@
+# 源码（发布编译后的 dist）
+src/
+
+# 开发工具
+tsconfig.json
+*.tsbuildinfo
+
+# 运行时数据（敏感 + 本地状态）
+.env
+workspace/
+
+# 开发依赖配置
+.env.example.local
+
+# 杂项
+*.log
+.DS_Store
