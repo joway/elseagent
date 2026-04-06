@@ -1,6 +1,6 @@
 {
   "name": "elseagent",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A personal assistant agent over Telegram, powered by Claude",
   "type": "module",
   "bin": {
@@ -19,7 +19,13 @@
     "build": "tsc",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["agent", "telegram", "claude", "anthropic", "ai"],
+  "keywords": [
+    "agent",
+    "telegram",
+    "claude",
+    "anthropic",
+    "ai"
+  ],
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
