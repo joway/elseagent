@@ -18,6 +18,7 @@ import { checkAndUpdate } from './updater.js'
 import { runAgent } from './agent.js'
 import { saveMemory } from './memory.js'
 import { initScheduler } from './scheduler.js'
+import { installBuiltinSkills } from './skills.js'
 import { log, logSeparator, initLogger } from './logger.js'
 import type { ToolContext } from './tools.js'
 
@@ -35,6 +36,7 @@ const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID
 const WORKSPACE_DIR   = path.resolve(process.env.WORKSPACE_DIR ?? './workspace')
 const LOG_DIR         = path.resolve(process.env.LOG_DIR    ?? path.join(WORKSPACE_DIR, 'logs'))
 const MEMORY_DIR      = path.resolve(process.env.MEMORY_DIR ?? path.join(WORKSPACE_DIR, 'memory'))
+const SKILLS_DIR      = path.resolve(process.env.SKILLS_DIR ?? path.join(WORKSPACE_DIR, 'skills'))
 
 if (!TELEGRAM_TOKEN) {
   console.error('Missing TELEGRAM_TOKEN in .env')
@@ -53,6 +55,8 @@ initLogger(LOG_DIR)
 log('info', `Agent started`)
 log('info', `Workspace : ${WORKSPACE_DIR}`)
 log('info', `Memory    : ${MEMORY_DIR}`)
+log('info', `Skills    : ${SKILLS_DIR}`)
+await installBuiltinSkills(SKILLS_DIR)
 log('info', ALLOWED_CHAT_ID ? `Restricted to chat_id: ${ALLOWED_CHAT_ID}` : 'Open to all chats (set ALLOWED_CHAT_ID to restrict)')
 
 // ─── 发送函数（供 scheduler 回调使用） ───────────────────────────────────────
@@ -67,7 +71,7 @@ async function sendMessage(chatId: number, text: string): Promise<void> {
 
 // ─── Scheduler 初始化 ─────────────────────────────────────────────────────────
 
-const baseCtx: Omit<ToolContext, 'chatId'> = { workspaceDir: WORKSPACE_DIR, memoryDir: MEMORY_DIR }
+const baseCtx: Omit<ToolContext, 'chatId'> = { workspaceDir: WORKSPACE_DIR, memoryDir: MEMORY_DIR, skillsDir: SKILLS_DIR }
 
 const scheduler = initScheduler(baseCtx, sendMessage, runAgent)
 await scheduler.init()

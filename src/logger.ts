@@ -11,17 +11,19 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-type StepType = 'user' | 'think' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'info' | 'system'
+type StepType = 'user' | 'think' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'info' | 'system' | 'api_req' | 'api_res'
 
 const COLORS: Record<StepType, string> = {
-  user:        '\x1b[36m',  // cyan
-  think:       '\x1b[33m',  // yellow  — 模型输出的思考文字
-  system:      '\x1b[2m',   // dim     — agent 自身的状态信息
-  tool_call:   '\x1b[35m',  // magenta
-  tool_result: '\x1b[32m',  // green
-  response:    '\x1b[34m',  // blue
-  error:       '\x1b[31m',  // red
-  info:        '\x1b[37m',  // white
+  user:        '\x1b[36m',   // cyan
+  think:       '\x1b[33m',   // yellow  — 模型输出的思考文字
+  system:      '\x1b[2m',    // dim     — agent 自身的状态信息
+  tool_call:   '\x1b[35m',   // magenta
+  tool_result: '\x1b[32m',   // green
+  response:    '\x1b[34m',   // blue
+  error:       '\x1b[31m',   // red
+  info:        '\x1b[37m',   // white
+  api_req:     '\x1b[38;5;208m', // orange — 发往 Claude 的请求
+  api_res:     '\x1b[38;5;141m', // purple — Claude 的原始返回
 }
 
 const ICONS: Record<StepType, string> = {
@@ -33,6 +35,8 @@ const ICONS: Record<StepType, string> = {
   response:    '💬',
   error:       '❌',
   info:        'ℹ️ ',
+  api_req:     '📤',
+  api_res:     '📥',
 }
 
 const RESET = '\x1b[0m'

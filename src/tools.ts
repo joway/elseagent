@@ -12,6 +12,7 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import { searchMemory, getRecentMemory } from './memory.js'
 import { getScheduler } from './scheduler.js'
+import { loadSkill } from './skills.js'
 
 const execAsync = promisify(exec)
 
@@ -83,6 +84,30 @@ export const toolDefinitions = [
         },
       },
       required: ['path'],
+    },
+  },
+
+  {
+    name: 'run_applescript',
+    description: [
+      'Execute an AppleScript to control macOS applications and system settings.',
+      'Use this to control Music.app, Spotify, volume, Finder, notifications, etc.',
+      'Examples:',
+      '  Play Music.app: tell application "Music" to play',
+      '  Pause Spotify:  tell application "Spotify" to pause',
+      '  Next track:     tell application "Music" to next track',
+      '  Set volume:     set volume output volume 50',
+      '  Get track info: tell application "Music" to get {name, artist} of current track',
+    ].join(' '),
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        script: {
+          type: 'string',
+          description: 'AppleScript code to execute (do not wrap in osascript, just the script body)',
+        },
+      },
+      required: ['script'],
     },
   },
 
@@ -177,6 +202,25 @@ export const toolDefinitions = [
       required: ['id'],
     },
   },
+
+  {
+    name: 'load_skill',
+    description: [
+      'Load the full instructions of a skill by name.',
+      'Call this when you identify that a skill listed in the system prompt is relevant to the user\'s request.',
+      'The returned instructions will guide how to best complete the task.',
+    ].join(' '),
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        name: {
+          type: 'string',
+          description: 'The skill name exactly as listed in the system prompt',
+        },
+      },
+      required: ['name'],
+    },
+  },
 ] as const
 
 // ─── 类型 ─────────────────────────────────────────────────────────────────────
@@ -185,6 +229,7 @@ export type ToolName = (typeof toolDefinitions)[number]['name']
 
 export type ToolInput = {
   run_shell:        { command: string }
+  run_applescript:  { script: string }
   write_file:       { path: string; content: string }
   read_file:        { path: string }
   list_files:       { path: string }
@@ -193,11 +238,13 @@ export type ToolInput = {
   create_cron:      { expression: string; task: string }
   list_crons:       Record<string, never>
   delete_cron:      { id: string }
+  load_skill:       { name: string }
 }
 
 export interface ToolContext {
   workspaceDir: string
   memoryDir: string
+  skillsDir: string
   chatId: number
 }
 
@@ -223,6 +270,18 @@ export async function executeTool(
       } catch (err: any) {
         const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
         return `[exit code ${err.code ?? '?'}]\n${out.trim()}`
+      }
+    }
+
+    case 'run_applescript': {
+      const { script } = input as ToolInput['run_applescript']
+      try {
+        const { stdout, stderr } = await execAsync(`osascript -e ${JSON.stringify(script)}`)
+        const out = [stdout, stderr].filter(Boolean).join('\n')
+        return out.trim() || '(no output)'
+      } catch (err: any) {
+        const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
+        return `[AppleScript error]\n${out.trim()}`
       }
     }
 
@@ -292,6 +351,13 @@ export async function executeTool(
       const { id } = input as ToolInput['delete_cron']
       const ok = await getScheduler().delete(id)
       return ok ? `Cron job ${id} deleted.` : `No cron job found with ID: ${id}`
+    }
+
+    case 'load_skill': {
+      const { name } = input as ToolInput['load_skill']
+      const content = await loadSkill(ctx.skillsDir, name)
+      if (!content) return `Skill "${name}" not found.`
+      return content
     }
 
     default:

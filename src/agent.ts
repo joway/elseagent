@@ -14,6 +14,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { toolDefinitions, executeTool } from './tools.js'
 import type { ToolName, ToolInput, ToolContext } from './tools.js'
+import { scanSkills, buildSkillSummary } from './skills.js'
 import { log } from './logger.js'
 
 // 懒初始化：等到 runAgent 首次调用时再创建，此时 dotenv 已经加载完毕
@@ -34,6 +35,13 @@ Memory:
 - Use get_recent_memory for: "what did you just do", "recap", "last task", anything about recent activity.
 - Use search_memory for: finding a specific past topic with concrete keywords (e.g. "Python scraper", "AWS config").
 - Do NOT guess keywords for search_memory — only use terms likely to appear verbatim in past messages.
+
+Mac control:
+- Use run_applescript to control macOS apps and system settings.
+- Music.app: tell application "Music" to play / pause / next track / previous track
+- Spotify:   tell application "Spotify" to play / pause / next track
+- Volume:    set volume output volume 50  (0–100)
+- Get current track: tell application "Music" to get {name, artist} of current track
 
 Scheduled tasks:
 - Use create_cron to set up a recurring task with a cron expression and a task description.
@@ -62,6 +70,12 @@ Do NOT use Markdown syntax (no backticks, no **bold**, no # headings).`
  * 返回最终文字回答（用于发回 Telegram）。
  */
 export async function runAgent(userMessage: string, ctx: ToolContext): Promise<string> {
+  // 每次运行时扫描 skill 目录，构建动态 system prompt
+  const skills = await scanSkills(ctx.skillsDir)
+  const skillSummary = buildSkillSummary(skills, ctx.skillsDir)
+  const systemPrompt = skillSummary
+    ? `${SYSTEM_PROMPT}\n\n${skillSummary}`
+    : SYSTEM_PROMPT
   // messages 是 agent 的对话历史 / 工作记忆
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: userMessage },
@@ -78,15 +92,31 @@ export async function runAgent(userMessage: string, ctx: ToolContext): Promise<s
     iteration++
     log('system', `--- Iteration ${iteration} --- calling Claude API`)
 
+    // 打印请求摘要：最新一条消息的内容（完整历史不重复打印）
+    const lastMsg = messages.at(-1)!
+    const lastContent = Array.isArray(lastMsg.content)
+      ? lastMsg.content.map(b => {
+          if ('type' in b && b.type === 'tool_result') return `[tool_result id=${b.tool_use_id}] ${String(b.content).slice(0, 200)}`
+          return JSON.stringify(b).slice(0, 200)
+        }).join('\n')
+      : String(lastMsg.content).slice(0, 200)
+    log('api_req', `→ Claude  model=claude-opus-4-6  messages=${messages.length}  last(${lastMsg.role}):`, lastContent)
+
     const response = await getClient().messages.create({
       model: 'claude-opus-4-6',
       max_tokens: 8096,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       tools: toolDefinitions as unknown as Anthropic.Tool[],
       messages,
     })
 
-    log('system', `stop_reason="${response.stop_reason}"  tokens=${response.usage.input_tokens}in/${response.usage.output_tokens}out`)
+    // 打印返回摘要：每个 content block 的类型和关键信息
+    const blockSummary = response.content.map(b => {
+      if (b.type === 'text')     return `[text] ${b.text.slice(0, 200)}`
+      if (b.type === 'tool_use') return `[tool_use] ${b.name}(${JSON.stringify(b.input).slice(0, 200)})`
+      return `[${b.type}]`
+    }).join('\n')
+    log('api_res', `← Claude  stop_reason=${response.stop_reason}  tokens=${response.usage.input_tokens}in/${response.usage.output_tokens}out`, blockSummary)
 
     // ── 解析响应内容块 ──────────────────────────────────────────────────────────
     const textBlocks    = response.content.filter((b): b is Anthropic.TextBlock    => b.type === 'text')

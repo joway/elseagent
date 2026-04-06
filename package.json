@@ -1,6 +1,6 @@
 {
   "name": "elseagent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A personal assistant agent over Telegram, powered by Claude",
   "type": "module",
   "bin": {
@@ -9,6 +9,7 @@
   "files": [
     "bin",
     "dist",
+    "skills",
     "AGENTS.md",
     ".env.example"
   ],

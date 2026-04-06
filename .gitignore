@@ -10,3 +10,6 @@ workspace/
 # 系统文件
 .DS_Store
 *.tsbuildinfo
+
+# 用户私有 skills（workspace 下的）由 workspace/ 规则覆盖
+# 项目内置 skills/ 目录正常追踪
