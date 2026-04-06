@@ -1,6 +1,6 @@
 ---
 name: weather
-description: 查询天气信息、温度、降雨概率和未来预报
+description: Query weather conditions, temperature, precipitation, and forecast
 ---
 You are helping the user with weather queries.
 

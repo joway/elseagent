@@ -1,6 +1,6 @@
 ---
 name: music
-description: 控制 Mac 本地音乐播放，包括播放、暂停、切歌、音量调节
+description: Control local music playback on Mac — play, pause, skip tracks, adjust volume
 ---
 You are helping the user control music playback on their Mac.
 
@@ -17,4 +17,4 @@ Common operations:
 
 For Spotify, replace "Music" with "Spotify".
 
-Always confirm what action was taken (e.g. "已暂停：周杰伦 - 稻香").
+Always confirm what action was taken (e.g. "Paused: Jay Chou —稻香").

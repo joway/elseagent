@@ -9,18 +9,25 @@
  *   4. 如果是 end_turn，说明 Claude 认为任务完成，返回最终回答
  *
  * messages 数组就是 agent 的"工作记忆"，记录整个推理过程。
+ *
+ * Braintrust 集成：
+ *   - wrapAnthropic：自动追踪每次 Claude API 调用（输入/输出/延迟/token）
+ *   - traced：把整个 runAgent 调用包装成顶层 span，关联所有子调用
  */
 
 import Anthropic from '@anthropic-ai/sdk'
+import { wrapAnthropic, traced, currentSpan } from 'braintrust'
 import { toolDefinitions, executeTool } from './tools.js'
 import type { ToolName, ToolInput, ToolContext } from './tools.js'
 import { scanSkills, buildSkillSummary } from './skills.js'
+import { plan, formatPlanForContext } from './planner.js'
 import { log } from './logger.js'
 
 // 懒初始化：等到 runAgent 首次调用时再创建，此时 dotenv 已经加载完毕
+// wrapAnthropic 在 Braintrust 未初始化时是 no-op，不影响正常运行
 let claude: Anthropic | null = null
 function getClient(): Anthropic {
-  if (!claude) claude = new Anthropic()
+  if (!claude) claude = wrapAnthropic(new Anthropic())
   return claude
 }
 
@@ -65,34 +72,86 @@ Format your response using ONLY these Telegram HTML tags:
 Escape these characters in plain text: &amp; → &amp;amp;  &lt; → &amp;lt;  &gt; → &amp;gt;
 Do NOT use Markdown syntax (no backticks, no **bold**, no # headings).`
 
+// 每轮对话保留的最大轮数（超出则裁掉最旧的）
+const MAX_HISTORY_TURNS = 20
+
+/** 对话历史中单条消息的结构（只保留文字，不保留 tool 内部状态） */
+export interface HistoryMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 /**
  * 运行 agent，处理单条用户消息。
- * 返回最终文字回答（用于发回 Telegram）。
+ * 接受当前会话的历史记录，返回回答和更新后的历史。
+ *
+ * 整个调用被包在一个 Braintrust span 里，所有子 API 调用自动作为子 span 上报。
  */
-export async function runAgent(userMessage: string, ctx: ToolContext): Promise<string> {
-  // 每次运行时扫描 skill 目录，构建动态 system prompt
+export async function runAgent(
+  userMessage: string,
+  ctx: ToolContext,
+  history: HistoryMessage[] = [],
+): Promise<{ response: string; history: HistoryMessage[] }> {
+  return traced(async () => {
+    currentSpan().log({
+      input: userMessage,
+      metadata: { chatId: ctx.chatId, historyTurns: history.length / 2 },
+    })
+
+    const response = await _runAgentLoop(userMessage, ctx, history)
+
+    currentSpan().log({ output: response })
+
+    // 追加本轮对话，并裁剪到 MAX_HISTORY_TURNS 轮
+    const updated: HistoryMessage[] = [
+      ...history,
+      { role: 'user', content: userMessage },
+      { role: 'assistant', content: response },
+    ]
+    const trimmed = updated.length > MAX_HISTORY_TURNS * 2
+      ? updated.slice(-MAX_HISTORY_TURNS * 2)
+      : updated
+
+    return { response, history: trimmed }
+  }, { name: 'agent', event: { tags: [`chat:${ctx.chatId}`] } })
+}
+
+/** 实际的 ReAct 循环，从 runAgent 中分离以保持 traced 回调简洁 */
+async function _runAgentLoop(
+  userMessage: string,
+  ctx: ToolContext,
+  history: HistoryMessage[],
+): Promise<string> {
   const skills = await scanSkills(ctx.skillsDir)
   const skillSummary = buildSkillSummary(skills, ctx.skillsDir)
-  const systemPrompt = skillSummary
-    ? `${SYSTEM_PROMPT}\n\n${skillSummary}`
-    : SYSTEM_PROMPT
-  // messages 是 agent 的对话历史 / 工作记忆
+
+  // Planning 阶段：复杂任务先生成计划，注入到 system prompt
+  const planResult = await plan(userMessage)
+  const planSection = !planResult.isSimple && planResult.steps.length > 0
+    ? '\n\n' + formatPlanForContext(planResult.steps)
+    : ''
+
+  const systemPrompt = [SYSTEM_PROMPT, skillSummary, planSection]
+    .filter(Boolean)
+    .join('\n\n')
+
+  // 历史消息在前，当前用户消息在最后
   const messages: Anthropic.MessageParam[] = [
+    ...history,
     { role: 'user', content: userMessage },
   ]
 
   let finalResponse = ''
   let iteration = 0
-  const MAX_ITERATIONS = 20 // 防止无限循环
+  let totalToolCalls = 0
+  const MAX_ITERATIONS = 20
 
   log('user', userMessage)
 
-  // ─── ReAct 主循环 ────────────────────────────────────────────────────────────
   while (iteration < MAX_ITERATIONS) {
     iteration++
     log('system', `--- Iteration ${iteration} --- calling Claude API`)
 
-    // 打印请求摘要：最新一条消息的内容（完整历史不重复打印）
     const lastMsg = messages.at(-1)!
     const lastContent = Array.isArray(lastMsg.content)
       ? lastMsg.content.map(b => {
@@ -110,7 +169,6 @@ export async function runAgent(userMessage: string, ctx: ToolContext): Promise<s
       messages,
     })
 
-    // 打印返回摘要：每个 content block 的类型和关键信息
     const blockSummary = response.content.map(b => {
       if (b.type === 'text')     return `[text] ${b.text.slice(0, 200)}`
       if (b.type === 'tool_use') return `[tool_use] ${b.name}(${JSON.stringify(b.input).slice(0, 200)})`
@@ -118,31 +176,27 @@ export async function runAgent(userMessage: string, ctx: ToolContext): Promise<s
     }).join('\n')
     log('api_res', `← Claude  stop_reason=${response.stop_reason}  tokens=${response.usage.input_tokens}in/${response.usage.output_tokens}out`, blockSummary)
 
-    // ── 解析响应内容块 ──────────────────────────────────────────────────────────
     const textBlocks    = response.content.filter((b): b is Anthropic.TextBlock    => b.type === 'text')
     const toolUseBlocks = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
 
-    // 打印思考内容
     for (const block of textBlocks) {
       log('think', block.text)
-      finalResponse = block.text // 最后一个 text block 作为最终回答
+      finalResponse = block.text
     }
 
-    // ── 任务完成 ────────────────────────────────────────────────────────────────
     if (response.stop_reason === 'end_turn') {
       log('response', finalResponse)
       break
     }
 
-    // ── 执行工具调用 ────────────────────────────────────────────────────────────
     if (response.stop_reason === 'tool_use' && toolUseBlocks.length > 0) {
-      // 把 assistant 的响应（包含 tool_use 块）加入历史
       messages.push({ role: 'assistant', content: response.content })
 
       const toolResults: Anthropic.ToolResultBlockParam[] = []
 
       for (const block of toolUseBlocks) {
         log('tool_call', `${block.name}`, block.input)
+        totalToolCalls++
 
         const result = await executeTool(
           block.name as ToolName,
@@ -159,12 +213,10 @@ export async function runAgent(userMessage: string, ctx: ToolContext): Promise<s
         })
       }
 
-      // 把工具结果作为 user 消息追加（Anthropic API 的约定）
       messages.push({ role: 'user', content: toolResults })
       continue
     }
 
-    // 兜底：未知 stop_reason，退出循环
     log('system', `Unexpected stop_reason: ${response.stop_reason}`)
     break
   }
@@ -173,6 +225,16 @@ export async function runAgent(userMessage: string, ctx: ToolContext): Promise<s
     log('system', `Reached max iterations (${MAX_ITERATIONS}), stopping`)
     finalResponse = finalResponse || 'Reached maximum iteration limit.'
   }
+
+  // 记录本次 loop 的统计信息到 span
+  currentSpan().log({
+    metadata: {
+      iterations: iteration,
+      toolCalls: totalToolCalls,
+      planned: !planResult.isSimple,
+      planSteps: planResult.steps.length,
+    },
+  })
 
   return finalResponse
 }

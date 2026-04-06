@@ -13,9 +13,11 @@
 import TelegramBot from 'node-telegram-bot-api'
 import * as dotenv from 'dotenv'
 import * as path from 'path'
+import { initLogger as initBraintrust } from 'braintrust'
 import { runSetupIfNeeded } from './setup.js'
 import { checkAndUpdate } from './updater.js'
 import { runAgent } from './agent.js'
+import type { HistoryMessage } from './agent.js'
 import { saveMemory } from './memory.js'
 import { initScheduler } from './scheduler.js'
 import { installBuiltinSkills } from './skills.js'
@@ -53,6 +55,12 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true })
 
 initLogger(LOG_DIR)
 log('info', `Agent started`)
+
+// Braintrust：有 API key 则启用 tracing，无则静默跳过
+if (process.env.BRAINTRUST_API_KEY) {
+  await initBraintrust({ projectName: 'elseagent', apiKey: process.env.BRAINTRUST_API_KEY })
+  log('info', 'Braintrust tracing enabled')
+}
 log('info', `Workspace : ${WORKSPACE_DIR}`)
 log('info', `Memory    : ${MEMORY_DIR}`)
 log('info', `Skills    : ${SKILLS_DIR}`)
@@ -79,6 +87,9 @@ await scheduler.init()
 // ─── 并发控制 ─────────────────────────────────────────────────────────────────
 
 const processingChats = new Set<number>()
+
+// 按 chatId 维护连续会话历史（进程重启后清空）
+const conversationHistory = new Map<number, HistoryMessage[]>()
 
 // ─── 消息处理 ─────────────────────────────────────────────────────────────────
 
@@ -115,7 +126,9 @@ bot.on('message', async (msg) => {
   const ctx: ToolContext = { ...baseCtx, chatId }
 
   try {
-    const response = await runAgent(text, ctx)
+    const history = conversationHistory.get(chatId) ?? []
+    const { response, history: updatedHistory } = await runAgent(text, ctx, history)
+    conversationHistory.set(chatId, updatedHistory)
 
     await sendMessage(chatId, response)
 

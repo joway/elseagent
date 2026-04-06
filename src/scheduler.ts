@@ -27,7 +27,7 @@ export interface CronJob {
 }
 
 type SendFn = (chatId: number, text: string) => Promise<void>
-type RunFn  = (task: string, ctx: ToolContext) => Promise<string>
+type RunFn  = (task: string, ctx: ToolContext) => Promise<string | { response: string; history: unknown[] }>
 
 // ─── Scheduler 类 ─────────────────────────────────────────────────────────────
 
@@ -98,7 +98,8 @@ export class Scheduler {
       log('system', `Cron fired [${job.id}] — ${job.task}`)
       const ctx: ToolContext = { ...this.baseCtx, chatId: job.chatId }
       try {
-        const response = await this.run(job.task, ctx)
+        const result = await this.run(job.task, ctx)
+        const response = typeof result === 'string' ? result : result.response
         await this.send(job.chatId, response)
         await saveMemory(this.baseCtx.memoryDir, job.chatId, `[Scheduled] ${job.task}`, response)
       } catch (err: any) {
