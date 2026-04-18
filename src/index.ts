@@ -17,7 +17,6 @@ import { initLogger as initBraintrust } from 'braintrust'
 import { runSetupIfNeeded } from './setup.js'
 import { checkAndUpdate } from './updater.js'
 import { runAgent } from './agent.js'
-import type { HistoryMessage } from './agent.js'
 import { saveMemory } from './memory.js'
 import { initScheduler } from './scheduler.js'
 import { installBuiltinSkills } from './skills.js'
@@ -88,9 +87,6 @@ await scheduler.init()
 
 const processingChats = new Set<number>()
 
-// 按 chatId 维护连续会话历史（进程重启后清空）
-const conversationHistory = new Map<number, HistoryMessage[]>()
-
 // ─── 消息处理 ─────────────────────────────────────────────────────────────────
 
 bot.on('message', async (msg) => {
@@ -126,9 +122,7 @@ bot.on('message', async (msg) => {
   const ctx: ToolContext = { ...baseCtx, chatId }
 
   try {
-    const history = conversationHistory.get(chatId) ?? []
-    const { response, history: updatedHistory } = await runAgent(text, ctx, history)
-    conversationHistory.set(chatId, updatedHistory)
+    const { response } = await runAgent(text, ctx)
 
     await sendMessage(chatId, response)
 

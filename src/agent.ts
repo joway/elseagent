@@ -72,9 +72,6 @@ Format your response using ONLY these Telegram HTML tags:
 Escape these characters in plain text: &amp; → &amp;amp;  &lt; → &amp;lt;  &gt; → &amp;gt;
 Do NOT use Markdown syntax (no backticks, no **bold**, no # headings).`
 
-// 每轮对话保留的最大轮数（超出则裁掉最旧的）
-const MAX_HISTORY_TURNS = 20
-
 /** 对话历史中单条消息的结构（只保留文字，不保留 tool 内部状态） */
 export interface HistoryMessage {
   role: 'user' | 'assistant'
@@ -102,17 +99,7 @@ export async function runAgent(
 
     currentSpan().log({ output: response })
 
-    // 追加本轮对话，并裁剪到 MAX_HISTORY_TURNS 轮
-    const updated: HistoryMessage[] = [
-      ...history,
-      { role: 'user', content: userMessage },
-      { role: 'assistant', content: response },
-    ]
-    const trimmed = updated.length > MAX_HISTORY_TURNS * 2
-      ? updated.slice(-MAX_HISTORY_TURNS * 2)
-      : updated
-
-    return { response, history: trimmed }
+    return { response, history: [] }
   }, { name: 'agent', event: { tags: [`chat:${ctx.chatId}`] } })
 }
 
@@ -128,12 +115,17 @@ async function _runAgentLoop(
   // Planning 阶段：复杂任务先生成计划，注入到 system prompt
   const planResult = await plan(userMessage)
   const planSection = !planResult.isSimple && planResult.steps.length > 0
-    ? '\n\n' + formatPlanForContext(planResult.steps)
+    ? formatPlanForContext(planResult.steps)
     : ''
 
-  const systemPrompt = [SYSTEM_PROMPT, skillSummary, planSection]
-    .filter(Boolean)
-    .join('\n\n')
+  // Prompt caching：把稳定的 system 内容（SYSTEM_PROMPT + skillSummary）标记为
+  // cache_control breakpoint，可变的 planSection 放在后面不缓存。
+  // tools 在渲染顺序上位于 system 之前，breakpoint 会同时缓存 tools + system。
+  const stableText = [SYSTEM_PROMPT, skillSummary].filter(Boolean).join('\n\n')
+  const systemBlocks: Anthropic.TextBlockParam[] = [
+    { type: 'text', text: stableText, cache_control: { type: 'ephemeral' } },
+    ...(planSection ? [{ type: 'text' as const, text: planSection }] : []),
+  ]
 
   // 历史消息在前，当前用户消息在最后
   const messages: Anthropic.MessageParam[] = [
@@ -164,17 +156,18 @@ async function _runAgentLoop(
     const response = await getClient().messages.create({
       model: 'claude-opus-4-6',
       max_tokens: 8096,
-      system: systemPrompt,
+      system: systemBlocks,
       tools: toolDefinitions as unknown as Anthropic.Tool[],
       messages,
     })
 
+    const { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens } = response.usage
     const blockSummary = response.content.map(b => {
       if (b.type === 'text')     return `[text] ${b.text.slice(0, 200)}`
       if (b.type === 'tool_use') return `[tool_use] ${b.name}(${JSON.stringify(b.input).slice(0, 200)})`
       return `[${b.type}]`
     }).join('\n')
-    log('api_res', `← Claude  stop_reason=${response.stop_reason}  tokens=${response.usage.input_tokens}in/${response.usage.output_tokens}out`, blockSummary)
+    log('api_res', `← Claude  stop_reason=${response.stop_reason}  tokens=${input_tokens}in/${output_tokens}out  cache_write=${cache_creation_input_tokens ?? 0}/cache_read=${cache_read_input_tokens ?? 0}`, blockSummary)
 
     const textBlocks    = response.content.filter((b): b is Anthropic.TextBlock    => b.type === 'text')
     const toolUseBlocks = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
