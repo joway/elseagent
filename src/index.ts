@@ -17,6 +17,7 @@ import { initLogger as initBraintrust } from 'braintrust'
 import { runSetupIfNeeded } from './setup.js'
 import { checkAndUpdate } from './updater.js'
 import { runAgent } from './agent.js'
+import type { HistoryMessage } from './agent.js'
 import { saveMemory } from './memory.js'
 import { initScheduler } from './scheduler.js'
 import { installBuiltinSkills } from './skills.js'
@@ -83,6 +84,20 @@ const baseCtx: Omit<ToolContext, 'chatId'> = { workspaceDir: WORKSPACE_DIR, memo
 const scheduler = initScheduler(baseCtx, sendMessage, runAgent)
 await scheduler.init()
 
+// ─── 会话状态（时间窗口） ──────────────────────────────────────────────────────
+
+// 两条消息间隔超过此时间则视为新会话，清空上下文
+const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MIN ?? '5') * 60 * 1000
+// 每个会话最多保留的轮数（1轮 = 1问1答）
+const SESSION_MAX_TURNS  = parseInt(process.env.SESSION_MAX_TURNS ?? '3')
+
+interface SessionState {
+  history:      HistoryMessage[]
+  lastActivity: number   // Date.now()
+}
+
+const sessions = new Map<number, SessionState>()
+
 // ─── 并发控制 ─────────────────────────────────────────────────────────────────
 
 const processingChats = new Set<number>()
@@ -122,7 +137,24 @@ bot.on('message', async (msg) => {
   const ctx: ToolContext = { ...baseCtx, chatId }
 
   try {
-    const { response } = await runAgent(text, ctx)
+    const now     = Date.now()
+    const session = sessions.get(chatId)
+    const history = (session && now - session.lastActivity < SESSION_TIMEOUT_MS)
+      ? session.history
+      : []
+
+    if (history.length > 0) {
+      log('info', `Session active (${history.length / 2} turns)`)
+    } else {
+      log('info', 'New session (no prior context)')
+    }
+
+    const { response } = await runAgent(text, ctx, history)
+
+    // 追加本轮，裁剪到 SESSION_MAX_TURNS 轮
+    const updated = [...history, { role: 'user' as const, content: text }, { role: 'assistant' as const, content: response }]
+    const trimmed = updated.length > SESSION_MAX_TURNS * 2 ? updated.slice(-SESSION_MAX_TURNS * 2) : updated
+    sessions.set(chatId, { history: trimmed, lastActivity: now })
 
     await sendMessage(chatId, response)
 
