@@ -1,245 +1,21 @@
 /**
- * tools.ts — 工具定义与实现
+ * tools.ts — AgentTool 定义（pi-agent-core 格式）
  *
- * 每个工具分两部分：
- *   1. toolDefinitions — 传给 Claude API 的 JSON schema，告诉模型工具能做什么
- *   2. executeTool     — 实际执行逻辑
+ * 每个工具使用 TypeBox schema 描述参数，execute 返回 AgentToolResult。
+ * 工具抛出异常会被 agent 捕获并作为 isError:true 的 tool_result 回传给模型。
  */
 
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import { Type } from '@sinclair/typebox'
+import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { searchMemory, getRecentMemory } from './memory.js'
 import { getScheduler } from './scheduler.js'
 import { loadSkill } from './skills.js'
 
 const execAsync = promisify(exec)
-
-// ─── 工具定义（Claude API 格式） ─────────────────────────────────────────────
-
-export const toolDefinitions = [
-  {
-    name: 'run_shell',
-    description: [
-      'Execute a shell command in the workspace directory and return stdout/stderr.',
-      'Use this to: run scripts, install packages, execute code, check system state.',
-      'Supports any shell command. Timeout is 60 seconds.',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        command: {
-          type: 'string',
-          description: 'The shell command to execute (e.g. "node script.js", "python3 -c \\"print(1+1)\\"", "ls -la")',
-        },
-      },
-      required: ['command'],
-    },
-  },
-
-  {
-    name: 'write_file',
-    description: 'Write (or overwrite) a file with the given content. Parent directories are created automatically.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        path: {
-          type: 'string',
-          description: 'File path relative to workspace (e.g. "script.py", "src/index.ts")',
-        },
-        content: {
-          type: 'string',
-          description: 'Full file content to write',
-        },
-      },
-      required: ['path', 'content'],
-    },
-  },
-
-  {
-    name: 'read_file',
-    description: 'Read the content of a file.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        path: {
-          type: 'string',
-          description: 'File path relative to workspace',
-        },
-      },
-      required: ['path'],
-    },
-  },
-
-  {
-    name: 'list_files',
-    description: 'List files and directories at a given path.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        path: {
-          type: 'string',
-          description: 'Directory path relative to workspace (use "." for workspace root)',
-        },
-      },
-      required: ['path'],
-    },
-  },
-
-  {
-    name: 'run_applescript',
-    description: [
-      'Execute an AppleScript to control macOS applications and system settings.',
-      'Use this to control Music.app, Spotify, volume, Finder, notifications, etc.',
-      'Examples:',
-      '  Play Music.app: tell application "Music" to play',
-      '  Pause Spotify:  tell application "Spotify" to pause',
-      '  Next track:     tell application "Music" to next track',
-      '  Set volume:     set volume output volume 50',
-      '  Get track info: tell application "Music" to get {name, artist} of current track',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        script: {
-          type: 'string',
-          description: 'AppleScript code to execute (do not wrap in osascript, just the script body)',
-        },
-      },
-      required: ['script'],
-    },
-  },
-
-  {
-    name: 'search_memory',
-    description: [
-      'Search past conversations by semantic similarity (vector search).',
-      'Use when the user refers to a specific topic discussed before (e.g. "that Python script", "the API we discussed").',
-      'NOT suitable for "what did we do recently" — use get_recent_memory instead.',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Natural language description of what you are looking for in past conversations',
-        },
-        limit: {
-          type: 'number',
-          description: 'Max number of results to return (default 5)',
-        },
-      },
-      required: ['query'],
-    },
-  },
-
-  {
-    name: 'get_recent_memory',
-    description: [
-      'Return the most recent N conversations, newest first.',
-      'Use for questions like "what did we do just now", "what was the last task", "recap our conversation".',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        limit: {
-          type: 'number',
-          description: 'Number of recent conversations to return (default 5)',
-        },
-      },
-      required: [],
-    },
-  },
-
-  {
-    name: 'create_cron',
-    description: [
-      'Create a scheduled task that runs automatically on a cron schedule.',
-      'The task description will be sent to the agent as a new message at each scheduled time.',
-      'Results are sent back to this Telegram chat.',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        expression: {
-          type: 'string',
-          description: [
-            'Standard cron expression (5 fields): "minute hour day month weekday".',
-            'Examples: "0 9 * * *" = every day at 9am, "0 * * * *" = every hour, "*/30 * * * *" = every 30 minutes.',
-          ].join(' '),
-        },
-        task: {
-          type: 'string',
-          description: 'Task description that the agent will execute at each scheduled time',
-        },
-      },
-      required: ['expression', 'task'],
-    },
-  },
-
-  {
-    name: 'list_crons',
-    description: 'List all scheduled cron jobs.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {},
-      required: [],
-    },
-  },
-
-  {
-    name: 'delete_cron',
-    description: 'Delete a scheduled cron job by its ID.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        id: {
-          type: 'string',
-          description: 'The cron job ID (visible in list_crons output)',
-        },
-      },
-      required: ['id'],
-    },
-  },
-
-  {
-    name: 'load_skill',
-    description: [
-      'Load the full instructions of a skill by name.',
-      'Call this when you identify that a skill listed in the system prompt is relevant to the user\'s request.',
-      'The returned instructions will guide how to best complete the task.',
-    ].join(' '),
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        name: {
-          type: 'string',
-          description: 'The skill name exactly as listed in the system prompt',
-        },
-      },
-      required: ['name'],
-    },
-  },
-] as const
-
-// ─── 类型 ─────────────────────────────────────────────────────────────────────
-
-export type ToolName = (typeof toolDefinitions)[number]['name']
-
-export type ToolInput = {
-  run_shell:        { command: string }
-  run_applescript:  { script: string }
-  write_file:       { path: string; content: string }
-  read_file:        { path: string }
-  list_files:       { path: string }
-  search_memory:    { query: string; limit?: number }
-  get_recent_memory: { limit?: number }
-  create_cron:      { expression: string; task: string }
-  list_crons:       Record<string, never>
-  delete_cron:      { id: string }
-  load_skill:       { name: string }
-}
 
 export interface ToolContext {
   workspaceDir: string
@@ -248,119 +24,222 @@ export interface ToolContext {
   chatId: number
 }
 
-// ─── 工具执行 ─────────────────────────────────────────────────────────────────
+const text = (s: string): AgentToolResult<unknown> => ({
+  content: [{ type: 'text', text: s }],
+  details: {},
+})
 
-export async function executeTool(
-  name: ToolName,
-  input: ToolInput[ToolName],
-  ctx: ToolContext,
-): Promise<string> {
-  await fs.mkdir(ctx.workspaceDir, { recursive: true })
+export function buildTools(ctx: ToolContext): AgentTool<any>[] {
+  return [
+    {
+      name: 'run_shell',
+      label: 'Shell',
+      description: [
+        'Execute a shell command in the workspace directory and return stdout/stderr.',
+        'Use this to: run scripts, install packages, execute code, check system state.',
+        'Supports any shell command. Timeout is 60 seconds.',
+      ].join(' '),
+      parameters: Type.Object({
+        command: Type.String({
+          description: 'The shell command to execute (e.g. "node script.js", "python3 -c \\"print(1+1)\\"", "ls -la")',
+        }),
+      }),
+      execute: async (_id, { command }) => {
+        await fs.mkdir(ctx.workspaceDir, { recursive: true })
+        try {
+          const { stdout, stderr } = await execAsync(command, { cwd: ctx.workspaceDir, timeout: 60_000 })
+          const out = [stdout, stderr].filter(Boolean).join('\n')
+          return text(out.trim() || '(no output)')
+        } catch (err: any) {
+          const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
+          return text(`[exit code ${err.code ?? '?'}]\n${out.trim()}`)
+        }
+      },
+    },
 
-  switch (name) {
-    case 'run_shell': {
-      const { command } = input as ToolInput['run_shell']
-      try {
-        const { stdout, stderr } = await execAsync(command, {
-          cwd: ctx.workspaceDir,
-          timeout: 60_000,
-        })
-        const out = [stdout, stderr].filter(Boolean).join('\n')
-        return out.trim() || '(no output)'
-      } catch (err: any) {
-        const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
-        return `[exit code ${err.code ?? '?'}]\n${out.trim()}`
-      }
-    }
+    {
+      name: 'run_applescript',
+      label: 'AppleScript',
+      description: [
+        'Execute an AppleScript to control macOS applications and system settings.',
+        'Use this to control Music.app, Spotify, volume, Finder, notifications, etc.',
+        'Examples:',
+        '  Play Music.app: tell application "Music" to play',
+        '  Pause Spotify:  tell application "Spotify" to pause',
+        '  Next track:     tell application "Music" to next track',
+        '  Set volume:     set volume output volume 50',
+        '  Get track info: tell application "Music" to get {name, artist} of current track',
+      ].join(' '),
+      parameters: Type.Object({
+        script: Type.String({
+          description: 'AppleScript code to execute (do not wrap in osascript, just the script body)',
+        }),
+      }),
+      execute: async (_id, { script }) => {
+        try {
+          const { stdout, stderr } = await execAsync(`osascript -e ${JSON.stringify(script)}`)
+          const out = [stdout, stderr].filter(Boolean).join('\n')
+          return text(out.trim() || '(no output)')
+        } catch (err: any) {
+          const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
+          return text(`[AppleScript error]\n${out.trim()}`)
+        }
+      },
+    },
 
-    case 'run_applescript': {
-      const { script } = input as ToolInput['run_applescript']
-      try {
-        const { stdout, stderr } = await execAsync(`osascript -e ${JSON.stringify(script)}`)
-        const out = [stdout, stderr].filter(Boolean).join('\n')
-        return out.trim() || '(no output)'
-      } catch (err: any) {
-        const out = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n')
-        return `[AppleScript error]\n${out.trim()}`
-      }
-    }
+    {
+      name: 'write_file',
+      label: 'Write File',
+      description: 'Write (or overwrite) a file with the given content. Parent directories are created automatically.',
+      parameters: Type.Object({
+        path: Type.String({ description: 'File path relative to workspace (e.g. "script.py", "src/index.ts")' }),
+        content: Type.String({ description: 'Full file content to write' }),
+      }),
+      execute: async (_id, { path: filePath, content }) => {
+        await fs.mkdir(ctx.workspaceDir, { recursive: true })
+        const abs = path.resolve(ctx.workspaceDir, filePath)
+        await fs.mkdir(path.dirname(abs), { recursive: true })
+        await fs.writeFile(abs, content, 'utf-8')
+        return text(`Written: ${filePath} (${content.length} bytes)`)
+      },
+    },
 
-    case 'write_file': {
-      const { path: filePath, content } = input as ToolInput['write_file']
-      const abs = path.resolve(ctx.workspaceDir, filePath)
-      await fs.mkdir(path.dirname(abs), { recursive: true })
-      await fs.writeFile(abs, content, 'utf-8')
-      return `Written: ${filePath} (${content.length} bytes)`
-    }
+    {
+      name: 'read_file',
+      label: 'Read File',
+      description: "Read the content of a file.",
+      parameters: Type.Object({
+        path: Type.String({ description: 'File path relative to workspace' }),
+      }),
+      execute: async (_id, { path: filePath }) => {
+        const abs = path.resolve(ctx.workspaceDir, filePath)
+        try {
+          const content = await fs.readFile(abs, 'utf-8')
+          return text(content || '(empty file)')
+        } catch (err: any) {
+          return text(`Error: ${err.message}`)
+        }
+      },
+    },
 
-    case 'read_file': {
-      const { path: filePath } = input as ToolInput['read_file']
-      const abs = path.resolve(ctx.workspaceDir, filePath)
-      try {
-        return await fs.readFile(abs, 'utf-8') || '(empty file)'
-      } catch (err: any) {
-        return `Error: ${err.message}`
-      }
-    }
+    {
+      name: 'list_files',
+      label: 'List Files',
+      description: 'List files and directories at a given path.',
+      parameters: Type.Object({
+        path: Type.String({ description: 'Directory path relative to workspace (use "." for workspace root)' }),
+      }),
+      execute: async (_id, { path: dirPath }) => {
+        const abs = path.resolve(ctx.workspaceDir, dirPath)
+        try {
+          const entries = await fs.readdir(abs, { withFileTypes: true })
+          if (entries.length === 0) return text('(empty directory)')
+          return text(entries.map(e => `${e.isDirectory() ? 'DIR ' : 'FILE'} ${e.name}`).join('\n'))
+        } catch (err: any) {
+          return text(`Error: ${err.message}`)
+        }
+      },
+    },
 
-    case 'list_files': {
-      const { path: dirPath } = input as ToolInput['list_files']
-      const abs = path.resolve(ctx.workspaceDir, dirPath)
-      try {
-        const entries = await fs.readdir(abs, { withFileTypes: true })
-        if (entries.length === 0) return '(empty directory)'
-        return entries.map(e => `${e.isDirectory() ? 'DIR ' : 'FILE'} ${e.name}`).join('\n')
-      } catch (err: any) {
-        return `Error: ${err.message}`
-      }
-    }
+    {
+      name: 'search_memory',
+      label: 'Search Memory',
+      description: [
+        'Search past conversations by semantic similarity (vector search).',
+        'Use when the user refers to a specific topic discussed before (e.g. "that Python script", "the API we discussed").',
+        'NOT suitable for "what did we do recently" — use get_recent_memory instead.',
+      ].join(' '),
+      parameters: Type.Object({
+        query: Type.String({ description: 'Natural language description of what you are looking for in past conversations' }),
+        limit: Type.Optional(Type.Number({ description: 'Max number of results to return (default 5)' })),
+      }),
+      execute: async (_id, { query, limit }) => {
+        const results = await searchMemory(ctx.memoryDir, query, limit ?? 5)
+        if (results.length === 0) return text('No matching memories found.')
+        return text(results.map(e => `[${e.ts}]\nUser: ${e.user}\nAgent: ${e.agent}`).join('\n\n---\n\n'))
+      },
+    },
 
-    case 'search_memory': {
-      const { query, limit } = input as ToolInput['search_memory']
-      const results = await searchMemory(ctx.memoryDir, query, limit ?? 5)
-      if (results.length === 0) return 'No matching memories found.'
-      return results
-        .map(e => `[${e.ts}]\nUser: ${e.user}\nAgent: ${e.agent}`)
-        .join('\n\n---\n\n')
-    }
+    {
+      name: 'get_recent_memory',
+      label: 'Recent Memory',
+      description: [
+        'Return the most recent N conversations, newest first.',
+        'Use for questions like "what did we do just now", "what was the last task", "recap our conversation".',
+      ].join(' '),
+      parameters: Type.Object({
+        limit: Type.Optional(Type.Number({ description: 'Number of recent conversations to return (default 5)' })),
+      }),
+      execute: async (_id, { limit }) => {
+        const results = await getRecentMemory(ctx.memoryDir, limit ?? 5)
+        if (results.length === 0) return text('No memory found.')
+        return text(results.map(e => `[${e.ts}]\nUser: ${e.user}\nAgent: ${e.agent}`).join('\n\n---\n\n'))
+      },
+    },
 
-    case 'get_recent_memory': {
-      const { limit } = input as ToolInput['get_recent_memory']
-      const results = await getRecentMemory(ctx.memoryDir, limit ?? 5)
-      if (results.length === 0) return 'No memory found.'
-      return results
-        .map(e => `[${e.ts}]\nUser: ${e.user}\nAgent: ${e.agent}`)
-        .join('\n\n---\n\n')
-    }
+    {
+      name: 'create_cron',
+      label: 'Create Cron',
+      description: [
+        'Create a scheduled task that runs automatically on a cron schedule.',
+        'The task description will be sent to the agent as a new message at each scheduled time.',
+        'Results are sent back to this Telegram chat.',
+      ].join(' '),
+      parameters: Type.Object({
+        expression: Type.String({
+          description: [
+            'Standard cron expression (5 fields): "minute hour day month weekday".',
+            'Examples: "0 9 * * *" = every day at 9am, "0 * * * *" = every hour, "*/30 * * * *" = every 30 minutes.',
+          ].join(' '),
+        }),
+        task: Type.String({ description: 'Task description that the agent will execute at each scheduled time' }),
+      }),
+      execute: async (_id, { expression, task }) => {
+        const job = await getScheduler().create(expression, task, ctx.chatId)
+        return text(`Cron job created:\nID: ${job.id}\nSchedule: ${job.expression}\nTask: ${job.task}`)
+      },
+    },
 
-    case 'create_cron': {
-      const { expression, task } = input as ToolInput['create_cron']
-      const job = await getScheduler().create(expression, task, ctx.chatId)
-      return `Cron job created:\nID: ${job.id}\nSchedule: ${job.expression}\nTask: ${job.task}`
-    }
+    {
+      name: 'list_crons',
+      label: 'List Crons',
+      description: 'List all scheduled cron jobs.',
+      parameters: Type.Object({}),
+      execute: async () => {
+        const jobs = getScheduler().list()
+        if (jobs.length === 0) return text('No scheduled jobs.')
+        return text(jobs.map(j => `ID: ${j.id}\nSchedule: ${j.expression}\nTask: ${j.task}\nCreated: ${j.createdAt}`).join('\n\n---\n\n'))
+      },
+    },
 
-    case 'list_crons': {
-      const jobs = getScheduler().list()
-      if (jobs.length === 0) return 'No scheduled jobs.'
-      return jobs
-        .map(j => `ID: ${j.id}\nSchedule: ${j.expression}\nTask: ${j.task}\nCreated: ${j.createdAt}`)
-        .join('\n\n---\n\n')
-    }
+    {
+      name: 'delete_cron',
+      label: 'Delete Cron',
+      description: 'Delete a scheduled cron job by its ID.',
+      parameters: Type.Object({
+        id: Type.String({ description: 'The cron job ID (visible in list_crons output)' }),
+      }),
+      execute: async (_id, { id }) => {
+        const ok = await getScheduler().delete(id)
+        return text(ok ? `Cron job ${id} deleted.` : `No cron job found with ID: ${id}`)
+      },
+    },
 
-    case 'delete_cron': {
-      const { id } = input as ToolInput['delete_cron']
-      const ok = await getScheduler().delete(id)
-      return ok ? `Cron job ${id} deleted.` : `No cron job found with ID: ${id}`
-    }
-
-    case 'load_skill': {
-      const { name } = input as ToolInput['load_skill']
-      const content = await loadSkill(ctx.skillsDir, name)
-      if (!content) return `Skill "${name}" not found.`
-      return content
-    }
-
-    default:
-      return `Unknown tool: ${name}`
-  }
+    {
+      name: 'load_skill',
+      label: 'Load Skill',
+      description: [
+        'Load the full instructions of a skill by name.',
+        "Call this when you identify that a skill listed in the system prompt is relevant to the user's request.",
+        'The returned instructions will guide how to best complete the task.',
+      ].join(' '),
+      parameters: Type.Object({
+        name: Type.String({ description: 'The skill name exactly as listed in the system prompt' }),
+      }),
+      execute: async (_id, { name }) => {
+        const content = await loadSkill(ctx.skillsDir, name)
+        return text(content ?? `Skill "${name}" not found.`)
+      },
+    },
+  ]
 }

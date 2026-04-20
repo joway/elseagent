@@ -1,35 +1,27 @@
 /**
- * agent.ts — Agent 核心循环（ReAct 模式）
+ * agent.ts — Agent 核心循环（基于 @mariozechner/pi-agent-core）
  *
- * ReAct = Reasoning + Acting
- * 每一轮循环：
- *   1. 把消息历史发给 Claude
- *   2. Claude 返回 text（思考/回答）或 tool_use（要调用工具）
- *   3. 如果是 tool_use，执行工具，把结果追加到消息历史，继续循环
- *   4. 如果是 end_turn，说明 Claude 认为任务完成，返回最终回答
- *
- * messages 数组就是 agent 的"工作记忆"，记录整个推理过程。
+ * 由 pi-agent-core 的 Agent 类驱动整个 ReAct 循环（think → tool_use → observe → ...）。
+ * 我们通过 agent.subscribe 订阅事件来打日志，业务逻辑保持不变。
  *
  * Braintrust 集成：
- *   - wrapAnthropic：自动追踪每次 Claude API 调用（输入/输出/延迟/token）
- *   - traced：把整个 runAgent 调用包装成顶层 span，关联所有子调用
+ *   - 保留 traced() 外层 span，记录本次 runAgent 的输入/输出和元数据
+ *   - 不再用 wrapAnthropic（pi-ai 自己管 provider client）
  */
 
-import Anthropic from '@anthropic-ai/sdk'
-import { wrapAnthropic, traced, currentSpan } from 'braintrust'
-import { toolDefinitions, executeTool } from './tools.js'
-import type { ToolName, ToolInput, ToolContext } from './tools.js'
+import { Agent } from '@mariozechner/pi-agent-core'
+import type { AgentMessage, AgentEvent } from '@mariozechner/pi-agent-core'
+import { getModel } from '@mariozechner/pi-ai'
+import type { Message, AssistantMessage } from '@mariozechner/pi-ai'
+import { traced, currentSpan } from 'braintrust'
+import { buildTools } from './tools.js'
+import type { ToolContext } from './tools.js'
 import { scanSkills, buildSkillSummary } from './skills.js'
 import { plan, formatPlanForContext } from './planner.js'
 import { log } from './logger.js'
 
-// 懒初始化：等到 runAgent 首次调用时再创建，此时 dotenv 已经加载完毕
-// wrapAnthropic 在 Braintrust 未初始化时是 no-op，不影响正常运行
-let claude: Anthropic | null = null
-function getClient(): Anthropic {
-  if (!claude) claude = wrapAnthropic(new Anthropic())
-  return claude
-}
+const MODEL = getModel('anthropic', 'claude-opus-4-6')
+const MAX_ITERATIONS = 20
 
 const SYSTEM_PROMPT = `You are a personal assistant agent. You help the user accomplish tasks by reasoning step by step and using tools when needed.
 
@@ -78,12 +70,44 @@ export interface HistoryMessage {
   content: string
 }
 
-/**
- * 运行 agent，处理单条用户消息。
- * 接受当前会话的历史记录，返回回答和更新后的历史。
- *
- * 整个调用被包在一个 Braintrust span 里，所有子 API 调用自动作为子 span 上报。
- */
+/** 把简单的历史对转换为 pi-ai 可接受的 Message[] */
+function hydrateHistory(history: HistoryMessage[]): Message[] {
+  return history.map<Message>(m => {
+    if (m.role === 'user') {
+      return { role: 'user', content: m.content, timestamp: Date.now() }
+    }
+    return {
+      role: 'assistant',
+      content: [{ type: 'text', text: m.content }],
+      api: MODEL.api,
+      provider: MODEL.provider,
+      model: MODEL.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: 'stop',
+      timestamp: Date.now(),
+    }
+  })
+}
+
+/** 只保留 LLM 可理解的三种 role */
+function convertToLlm(messages: AgentMessage[]): Message[] {
+  return messages.filter((m): m is Message =>
+    m.role === 'user' || m.role === 'assistant' || m.role === 'toolResult',
+  )
+}
+
+/** 提取最后一条 assistant 消息里的纯文字 */
+function extractFinalText(messages: AgentMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'assistant') continue
+    const am = m as AssistantMessage
+    const parts = am.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text)
+    if (parts.length > 0) return parts.join('\n').trim()
+  }
+  return ''
+}
+
 export async function runAgent(
   userMessage: string,
   ctx: ToolContext,
@@ -103,7 +127,6 @@ export async function runAgent(
   }, { name: 'agent', event: { tags: [`chat:${ctx.chatId}`] } })
 }
 
-/** 实际的 ReAct 循环，从 runAgent 中分离以保持 traced 回调简洁 */
 async function _runAgentLoop(
   userMessage: string,
   ctx: ToolContext,
@@ -112,122 +135,89 @@ async function _runAgentLoop(
   const skills = await scanSkills(ctx.skillsDir)
   const skillSummary = buildSkillSummary(skills, ctx.skillsDir)
 
-  // Planning 阶段：复杂任务先生成计划，注入到 system prompt
   const planResult = await plan(userMessage)
   const planSection = !planResult.isSimple && planResult.steps.length > 0
     ? formatPlanForContext(planResult.steps)
     : ''
 
-  // Prompt caching：把稳定的 system 内容（SYSTEM_PROMPT + skillSummary）标记为
-  // cache_control breakpoint，可变的 planSection 放在后面不缓存。
-  // tools 在渲染顺序上位于 system 之前，breakpoint 会同时缓存 tools + system。
-  const stableText = [SYSTEM_PROMPT, skillSummary].filter(Boolean).join('\n\n')
-  const systemBlocks: Anthropic.TextBlockParam[] = [
-    { type: 'text', text: stableText, cache_control: { type: 'ephemeral' } },
-    ...(planSection ? [{ type: 'text' as const, text: planSection }] : []),
-  ]
-
-  // 历史消息在前，当前用户消息在最后
-  const messages: Anthropic.MessageParam[] = [
-    ...history,
-    { role: 'user', content: userMessage },
-  ]
-
-  let finalResponse = ''
-  let iteration = 0
-  let totalToolCalls = 0
-  const MAX_ITERATIONS = 20
+  const systemPrompt = [SYSTEM_PROMPT, skillSummary, planSection].filter(Boolean).join('\n\n')
 
   log('user', userMessage)
 
-  while (iteration < MAX_ITERATIONS) {
-    iteration++
-    log('system', `--- Iteration ${iteration} --- calling Claude API`)
+  let turn = 0
+  let toolCalls = 0
+  let abortedByMaxIterations = false
 
-    const lastMsg = messages.at(-1)!
-    const lastContent = Array.isArray(lastMsg.content)
-      ? lastMsg.content.map(b => {
-          if ('type' in b && b.type === 'tool_result') return `[tool_result id=${b.tool_use_id}] ${String(b.content).slice(0, 200)}`
-          return JSON.stringify(b).slice(0, 200)
-        }).join('\n')
-      : String(lastMsg.content).slice(0, 200)
-    log('api_req', `→ Claude  model=claude-opus-4-6  messages=${messages.length}  last(${lastMsg.role}):`, lastContent)
+  const agent = new Agent({
+    initialState: {
+      systemPrompt,
+      model: MODEL,
+      tools: buildTools(ctx),
+      messages: hydrateHistory(history),
+    },
+    convertToLlm,
+    sessionId: `chat-${ctx.chatId}`,
+  })
 
-    const response = await getClient().messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 8096,
-      system: systemBlocks,
-      tools: toolDefinitions as unknown as Anthropic.Tool[],
-      messages,
-    })
-
-    const { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens } = response.usage
-    const blockSummary = response.content.map(b => {
-      if (b.type === 'text')     return `[text] ${b.text.slice(0, 200)}`
-      if (b.type === 'tool_use') return `[tool_use] ${b.name}(${JSON.stringify(b.input).slice(0, 200)})`
-      return `[${b.type}]`
-    }).join('\n')
-    log('api_res', `← Claude  stop_reason=${response.stop_reason}  tokens=${input_tokens}in/${output_tokens}out  cache_write=${cache_creation_input_tokens ?? 0}/cache_read=${cache_read_input_tokens ?? 0}`, blockSummary)
-
-    const textBlocks    = response.content.filter((b): b is Anthropic.TextBlock    => b.type === 'text')
-    const toolUseBlocks = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
-
-    for (const block of textBlocks) {
-      log('think', block.text)
-      finalResponse = block.text
-    }
-
-    if (response.stop_reason === 'end_turn') {
-      log('response', finalResponse)
-      break
-    }
-
-    if (response.stop_reason === 'tool_use' && toolUseBlocks.length > 0) {
-      messages.push({ role: 'assistant', content: response.content })
-
-      const toolResults: Anthropic.ToolResultBlockParam[] = []
-
-      for (const block of toolUseBlocks) {
-        log('tool_call', `${block.name}`, block.input)
-        totalToolCalls++
-
-        const result = await executeTool(
-          block.name as ToolName,
-          block.input as ToolInput[ToolName],
-          ctx,
-        )
-
-        log('tool_result', `${block.name} →`, result)
-
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: result,
-        })
+  agent.subscribe((event: AgentEvent) => {
+    switch (event.type) {
+      case 'turn_start':
+        turn++
+        log('system', `--- Turn ${turn} ---`)
+        if (turn > MAX_ITERATIONS) {
+          abortedByMaxIterations = true
+          agent.abort()
+        }
+        break
+      case 'message_end': {
+        const m = event.message
+        if (m.role === 'assistant') {
+          const am = m as AssistantMessage
+          const u = am.usage
+          const blocks = am.content.map(b => {
+            if (b.type === 'text') return `[text] ${b.text.slice(0, 200)}`
+            if (b.type === 'toolCall') return `[tool_use] ${b.name}(${JSON.stringify(b.arguments).slice(0, 200)})`
+            if (b.type === 'thinking') return `[thinking] ${b.thinking.slice(0, 200)}`
+            return `[${(b as { type: string }).type}]`
+          }).join('\n')
+          log('api_res', `← ${am.model}  stop=${am.stopReason}  tokens=${u.input}in/${u.output}out  cache_w=${u.cacheWrite}/cache_r=${u.cacheRead}`, blocks)
+          for (const b of am.content) {
+            if (b.type === 'text') log('think', b.text)
+          }
+        }
+        break
       }
-
-      messages.push({ role: 'user', content: toolResults })
-      continue
+      case 'tool_execution_start':
+        toolCalls++
+        log('tool_call', event.toolName, event.args)
+        break
+      case 'tool_execution_end': {
+        const content = Array.isArray(event.result?.content)
+          ? event.result.content.map((c: any) => c.type === 'text' ? c.text : `[${c.type}]`).join('\n')
+          : String(event.result)
+        log(event.isError ? 'error' : 'tool_result', `${event.toolName} →`, content)
+        break
+      }
     }
+  })
 
-    log('system', `Unexpected stop_reason: ${response.stop_reason}`)
-    break
-  }
+  await agent.prompt(userMessage)
 
-  if (iteration >= MAX_ITERATIONS) {
+  if (abortedByMaxIterations) {
     log('system', `Reached max iterations (${MAX_ITERATIONS}), stopping`)
-    finalResponse = finalResponse || 'Reached maximum iteration limit.'
   }
 
-  // 记录本次 loop 的统计信息到 span
+  const finalText = extractFinalText(agent.state.messages) || (abortedByMaxIterations ? 'Reached maximum iteration limit.' : '')
+  if (finalText) log('response', finalText)
+
   currentSpan().log({
     metadata: {
-      iterations: iteration,
-      toolCalls: totalToolCalls,
+      turns: turn,
+      toolCalls,
       planned: !planResult.isSimple,
       planSteps: planResult.steps.length,
     },
   })
 
-  return finalResponse
+  return finalText
 }
