@@ -9,7 +9,17 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+// TypeBox：JSON-Schema-in-TypeScript，pi-ai/agent-core 用它描述 tool 参数。
+// Type.Object/String/Number/... 构造出的 schema 同时是：
+//   - 运行时对象：被 AJV 用于参数校验（失败自动反馈给 LLM 让其重试）
+//   - 编译期类型：Static<typeof schema> 推导出 execute() 里 params 的精确类型
+// 因此下面 execute 里 { command, path, ... } 解构无需手写类型。
 import { Type } from '@sinclair/typebox'
+
+// AgentTool：pi-agent-core 的工具契约，比 pi-ai 的 Tool 多了 label、executionMode、execute 等。
+// AgentToolResult：execute 的返回形状 { content: (TextContent|ImageContent)[], details }。
+//   - content 会被包成 toolResult 消息回传给 LLM
+//   - details 仅供宿主 UI/日志用，LLM 看不到
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core'
 import { searchMemory, getRecentMemory } from './memory.js'
 import { getScheduler } from './scheduler.js'
@@ -29,6 +39,15 @@ const text = (s: string): AgentToolResult<unknown> => ({
   details: {},
 })
 
+// 每个 AgentTool 字段的语义：
+//   name        —— 传给 LLM 的函数名（LLM 在 toolCall.name 里引用）
+//   label       —— 仅给 UI 用的人类可读名，LLM 看不到
+//   description —— 送给 LLM 的函数用途说明，影响选择工具的准确率
+//   parameters  —— TypeBox schema，序列化到 LLM 作为 JSON Schema；调用时自动 AJV 校验
+//   execute     —— 实际执行体，签名 (toolCallId, validatedParams, signal?, onUpdate?) => Promise<AgentToolResult>
+//                  抛异常 = 报告失败（框架自动转成 isError:true 的 toolResult）
+//                  onUpdate 可流式推送 partialResult，触发 tool_execution_update 事件
+// buildTools 每次调用构造新数组，闭包捕获 ctx（chatId 等），避免全局状态。
 export function buildTools(ctx: ToolContext): AgentTool<any>[] {
   return [
     {

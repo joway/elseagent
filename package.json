@@ -1,6 +1,6 @@
 {
   "name": "elseagent",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "A personal assistant agent over Telegram, powered by Claude",
   "type": "module",
   "bin": {
@@ -14,7 +14,7 @@
     ".env.example"
   ],
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "AGENT_MODEL=claude-haiku-4-5 tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",
     "prepublishOnly": "npm run build"

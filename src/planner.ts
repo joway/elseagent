@@ -9,6 +9,9 @@
  */
 
 import { traced, currentSpan } from 'braintrust'
+// pi-ai 直接用，不走 Agent：这里只要一次性的单轮 LLM 调用，无工具、无循环。
+//   - getModel(provider, id) 查表拿 Model 元数据
+//   - complete(model, context, options) 一次性跑完流并返回完整 AssistantMessage（内部也是走 stream，只是聚合好）
 import { getModel, complete } from '@mariozechner/pi-ai'
 import { log } from './logger.js'
 
@@ -38,16 +41,23 @@ export interface PlanResult {
 }
 
 export async function plan(userMessage: string): Promise<PlanResult> {
+  // planner span 改成 type:'llm'：这是一次纯 LLM 调用，让 Braintrust 按 LLM span 计算成本
   return traced(async () => {
     currentSpan().log({ input: userMessage })
 
     log('system', 'Planning phase: analyzing task complexity...')
 
+    // complete() 第二个参数是 Context：{ systemPrompt?, messages, tools? }。
+    // messages 里每条必须带 timestamp（pi-ai 的 Message schema 要求），content 可以是字符串或 block[]。
+    // 第三个参数是 SimpleStreamOptions：maxTokens/temperature/signal/sessionId/reasoning 等；
+    // 不传 tools 就是纯对话，stopReason 只会是 'stop' 或 'length'。
     const response = await complete(PLANNER_MODEL, {
       systemPrompt: PLANNER_SYSTEM,
       messages: [{ role: 'user', content: userMessage, timestamp: Date.now() }],
     }, { maxTokens: 512 })
 
+    // complete() 返回完整的 AssistantMessage：{ role:'assistant', content: Block[], usage, stopReason, ... }。
+    // content 是 block 数组而非字符串——纯文本回复里通常只有一个 TextContent block。
     const raw = response.content
       .filter(b => b.type === 'text')
       .map(b => (b as { text: string }).text)
@@ -72,10 +82,29 @@ export async function plan(userMessage: string): Promise<PlanResult> {
       log('system', `Plan: ${steps.length} steps`, steps.map((s, i) => `${i + 1}. ${s}`).join('\n'))
     }
 
-    currentSpan().log({ output: raw, metadata: { isSimple, stepCount: steps.length } })
+    // 把 pi-ai 算好的 usage/cost 翻译成 Braintrust 的标准指标键，让 Estimated cost 能自动计算
+    const u = response.usage
+    currentSpan().log({
+      output: raw,
+      metadata: {
+        isSimple,
+        stepCount: steps.length,
+        model: response.model,
+        provider: response.provider,
+        api: response.api,
+      },
+      metrics: {
+        prompt_tokens: u.input,
+        completion_tokens: u.output,
+        tokens: u.totalTokens,
+        prompt_cached_tokens: u.cacheRead,
+        prompt_cache_creation_tokens: u.cacheWrite,
+        cost_usd: u.cost.total,
+      },
+    })
 
     return result
-  }, { name: 'planner' })
+  }, { name: 'planner', type: 'llm' })
 }
 
 export function formatPlanForContext(steps: string[]): string {
