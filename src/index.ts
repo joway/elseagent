@@ -17,6 +17,8 @@ import { initLogger as initBraintrust } from 'braintrust'
 import { runSetupIfNeeded } from './setup.js'
 import { checkAndUpdate } from './updater.js'
 import { runAgent } from './agent.js'
+import { runAgentCli } from './claudeCli.js'
+import { runAgentCodex } from './codexCli.js'
 import type { HistoryMessage } from './agent.js'
 import { saveMemory } from './memory.js'
 import { initScheduler } from './scheduler.js'
@@ -40,11 +42,28 @@ const LOG_DIR         = path.resolve(process.env.LOG_DIR    ?? path.join(WORKSPA
 const MEMORY_DIR      = path.resolve(process.env.MEMORY_DIR ?? path.join(WORKSPACE_DIR, 'memory'))
 const SKILLS_DIR      = path.resolve(process.env.SKILLS_DIR ?? path.join(WORKSPACE_DIR, 'skills'))
 
+// 后端选择（AGENT_BACKEND）：
+//   claude → `claude -p`     （Claude Code 订阅额度）
+//   codex  → `codex exec`    （OpenAI Codex 订阅额度）
+//   其它/空 → Anthropic API
+// CLI 类后端只能用各自 CLI 自带工具，本项目的 memory/cron/skills 工具不可用。
+const AGENT_BACKEND = process.env.AGENT_BACKEND ?? ''
+const USE_CLI_BACKEND = AGENT_BACKEND === 'claude' || AGENT_BACKEND === 'codex'
+const agentBackend =
+  AGENT_BACKEND === 'claude' ? runAgentCli   :
+  AGENT_BACKEND === 'codex'  ? runAgentCodex :
+  runAgent
+const backendLabel =
+  AGENT_BACKEND === 'claude' ? 'claude -p (CLI)'   :
+  AGENT_BACKEND === 'codex'  ? 'codex exec (CLI)'  :
+  'Anthropic API'
+
 if (!TELEGRAM_TOKEN) {
   console.error('Missing TELEGRAM_TOKEN in .env')
   process.exit(1)
 }
-if (!process.env.ANTHROPIC_API_KEY) {
+// CLI 类后端靠各自订阅鉴权，无需 ANTHROPIC_API_KEY
+if (!USE_CLI_BACKEND && !process.env.ANTHROPIC_API_KEY) {
   console.error('Missing ANTHROPIC_API_KEY in .env')
   process.exit(1)
 }
@@ -55,6 +74,7 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true })
 
 initLogger(LOG_DIR)
 log('info', `Agent started`)
+log('info', `Backend   : ${backendLabel}`)
 
 // Braintrust：有 API key 则启用 tracing，无则静默跳过
 if (process.env.BRAINTRUST_API_KEY) {
@@ -81,7 +101,7 @@ async function sendMessage(chatId: number, text: string): Promise<void> {
 
 const baseCtx: Omit<ToolContext, 'chatId'> = { workspaceDir: WORKSPACE_DIR, memoryDir: MEMORY_DIR, skillsDir: SKILLS_DIR }
 
-const scheduler = initScheduler(baseCtx, sendMessage, runAgent)
+const scheduler = initScheduler(baseCtx, sendMessage, agentBackend)
 await scheduler.init()
 
 // ─── 会话状态（时间窗口） ──────────────────────────────────────────────────────
@@ -149,7 +169,7 @@ bot.on('message', async (msg) => {
       log('info', 'New session (no prior context)')
     }
 
-    const { response } = await runAgent(text, ctx, history)
+    const { response } = await agentBackend(text, ctx, history)
 
     // 追加本轮，裁剪到 SESSION_MAX_TURNS 轮
     const updated = [...history, { role: 'user' as const, content: text }, { role: 'assistant' as const, content: response }]
