@@ -95,6 +95,23 @@ export interface HistoryMessage {
   content: string
 }
 
+/**
+ * 执行过程的进度回调：agent loop 每推进一步（turn / tool）就调一次。
+ * index.ts 用它把过程实时显示到 Telegram，任务结束后再撤回那条消息。
+ */
+export type ProgressFn = (text: string) => void
+
+/** 把工具参数压成一行短摘要，供进度展示用 */
+function summarizeArgs(args: unknown): string {
+  try {
+    const s = JSON.stringify(args)
+    if (!s || s === '{}') return ''
+    return s.length > 80 ? s.slice(0, 80) + '…' : s
+  } catch {
+    return ''
+  }
+}
+
 /** 把简单的历史对转换为 pi-ai 可接受的 Message[] */
 function hydrateHistory(history: HistoryMessage[]): Message[] {
   const model = getAgentModel()
@@ -144,6 +161,7 @@ export async function runAgent(
   userMessage: string,
   ctx: ToolContext,
   history: HistoryMessage[] = [],
+  onProgress?: ProgressFn,
 ): Promise<{ response: string; history: HistoryMessage[] }> {
   return traced(async () => {
     currentSpan().log({
@@ -151,7 +169,7 @@ export async function runAgent(
       metadata: { chatId: ctx.chatId, historyTurns: history.length / 2 },
     })
 
-    const response = await _runAgentLoop(userMessage, ctx, history)
+    const response = await _runAgentLoop(userMessage, ctx, history, onProgress)
 
     currentSpan().log({ output: response })
 
@@ -163,6 +181,7 @@ async function _runAgentLoop(
   userMessage: string,
   ctx: ToolContext,
   history: HistoryMessage[],
+  onProgress?: ProgressFn,
 ): Promise<string> {
   const skills = await scanSkills(ctx.skillsDir)
   const skillSummary = buildSkillSummary(skills, ctx.skillsDir)
@@ -221,6 +240,7 @@ async function _runAgentLoop(
         // agent.abort() 通过内部 AbortController 传播到正在跑的 stream/tool，安全中断。
         turn++
         log('system', `--- Turn ${turn} ---`)
+        onProgress?.(`🤔 Thinking… (turn ${turn})`)
         if (turn > MAX_ITERATIONS) {
           abortedByMaxIterations = true
           agent.abort()
@@ -279,6 +299,7 @@ async function _runAgentLoop(
         // 而是被自动转换成 isError:true 的 tool_result 回传给 LLM，让它自行纠正重试。
         toolCalls++
         log('tool_call', event.toolName, event.args)
+        onProgress?.(`🔧 ${event.toolName} ${summarizeArgs(event.args)}`.trim())
         break
       case 'tool_execution_end': {
         // event.result 是 AgentToolResult 形状：{ content: (TextContent|ImageContent)[], details: any }。
@@ -287,6 +308,7 @@ async function _runAgentLoop(
           ? event.result.content.map((c: any) => c.type === 'text' ? c.text : `[${c.type}]`).join('\n')
           : String(event.result)
         log(event.isError ? 'error' : 'tool_result', `${event.toolName} →`, content)
+        onProgress?.(event.isError ? `✗ ${event.toolName} failed` : `✓ ${event.toolName} done`)
         break
       }
     }

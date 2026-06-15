@@ -97,6 +97,64 @@ async function sendMessage(chatId: number, text: string): Promise<void> {
   }
 }
 
+// ─── 进度提示（执行过程实时显示，结束后撤回） ─────────────────────────────────
+//
+// 思路：把 agent 执行过程中的每一步（思考 / 工具调用）作为一条「状态消息」实时
+// 编辑到 Telegram 里，让用户看到进度；任务跑完拿到最终回复后，再把这条状态消息
+// deleteMessage（撤回）掉，只留下最终答案，聊天记录保持干净。
+
+const PROGRESS_MAX_LINES = 8  // 状态消息里最多展示的最近几行
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+class ProgressReporter {
+  private messageId: number | null = null
+  private lines: string[] = []
+  private lastText = ''
+  // 串行化所有 Telegram 调用，避免编辑乱序 / 并发触发限流
+  private queue: Promise<void> = Promise.resolve()
+
+  constructor(private readonly chatId: number) {}
+
+  /** 推入一条进度，异步刷新到 Telegram（不阻塞 agent loop） */
+  push(line: string): void {
+    this.queue = this.queue.then(() => this.render(line)).catch(() => {})
+  }
+
+  private async render(line: string): Promise<void> {
+    this.lines.push(line)
+    const recent = this.lines.slice(-PROGRESS_MAX_LINES)
+    const text = '⏳ <i>Working…</i>\n' + recent.map(l => '· ' + escapeHtml(l)).join('\n')
+    if (text === this.lastText) return  // 内容没变就不编辑，避免 "message is not modified"
+    this.lastText = text
+    try {
+      if (this.messageId == null) {
+        const m = await bot.sendMessage(this.chatId, text, { parse_mode: 'HTML' })
+        this.messageId = m.message_id
+      } else {
+        await bot.editMessageText(text, {
+          chat_id: this.chatId,
+          message_id: this.messageId,
+          parse_mode: 'HTML',
+        })
+      }
+    } catch {
+      // 限流 / 已被删除等错误忽略，进度提示是尽力而为的
+    }
+  }
+
+  /** 任务结束：等待挂起的编辑完成后撤回状态消息 */
+  async finish(): Promise<void> {
+    await this.queue
+    if (this.messageId != null) {
+      await bot.deleteMessage(this.chatId, this.messageId).catch(() => {})
+      this.messageId = null
+    }
+  }
+}
+
 // ─── Scheduler 初始化 ─────────────────────────────────────────────────────────
 
 const baseCtx: Omit<ToolContext, 'chatId'> = { workspaceDir: WORKSPACE_DIR, memoryDir: MEMORY_DIR, skillsDir: SKILLS_DIR }
@@ -153,6 +211,9 @@ bot.on('message', async (msg) => {
   }, 4000)
   await bot.sendChatAction(chatId, 'typing')
 
+  // 执行过程实时显示到 Telegram，结束后撤回
+  const progress = new ProgressReporter(chatId)
+
   // 每条消息创建含 chatId 的 ctx（scheduler 的 create_cron 需要知道 chatId）
   const ctx: ToolContext = { ...baseCtx, chatId }
 
@@ -169,7 +230,7 @@ bot.on('message', async (msg) => {
       log('info', 'New session (no prior context)')
     }
 
-    const { response } = await agentBackend(text, ctx, history)
+    const { response } = await agentBackend(text, ctx, history, (line) => progress.push(line))
 
     // 追加本轮，裁剪到 SESSION_MAX_TURNS 轮
     const updated = [...history, { role: 'user' as const, content: text }, { role: 'assistant' as const, content: response }]
@@ -185,6 +246,8 @@ bot.on('message', async (msg) => {
     log('error', `Agent error: ${err.message}`)
     await bot.sendMessage(chatId, `❌ Error: ${err.message}`)
   } finally {
+    // 撤回执行过程的状态消息，只留下最终回复
+    await progress.finish()
     if (typingInterval) {
       clearInterval(typingInterval)
       typingInterval = null

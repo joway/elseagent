@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { traced, currentSpan } from 'braintrust'
-import type { HistoryMessage } from './agent.js'
+import type { HistoryMessage, ProgressFn } from './agent.js'
 import type { ToolContext } from './tools.js'
 import { log } from './logger.js'
 
@@ -41,7 +41,7 @@ function buildPrompt(userMessage: string, history: HistoryMessage[]): string {
   return parts.join('\n\n')
 }
 
-async function invokeCodexCli(prompt: string, ctx: ToolContext): Promise<string> {
+async function invokeCodexCli(prompt: string, ctx: ToolContext, onProgress?: ProgressFn): Promise<string> {
   const bin     = process.env.CODEX_CLI_PATH    || 'codex'
   const model   = process.env.CODEX_CLI_MODEL   || undefined
   const sandbox = process.env.CODEX_SANDBOX_MODE || 'workspace-write'
@@ -63,7 +63,14 @@ async function invokeCodexCli(prompt: string, ctx: ToolContext): Promise<string>
   return await new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
     let stderr = ''
-    child.stdout.on('data', () => {})   // 进度日志，丢弃；最终回复从 outFile 读
+    // codex 把执行进度打到 stdout（最终回复另从 outFile 读），这里转发给进度回调
+    child.stdout.on('data', d => {
+      if (!onProgress) return
+      for (const raw of d.toString().split('\n')) {
+        const line = raw.trim()
+        if (line) onProgress(line.length > 100 ? line.slice(0, 100) + '…' : line)
+      }
+    })
     child.stderr.on('data', d => { stderr += d.toString() })
     child.on('error', reject)
     child.on('close', async code => {
@@ -88,6 +95,7 @@ export async function runAgentCodex(
   userMessage: string,
   ctx: ToolContext,
   history: HistoryMessage[] = [],
+  onProgress?: ProgressFn,
 ): Promise<{ response: string; history: HistoryMessage[] }> {
   return traced(async () => {
     currentSpan().log({
@@ -96,8 +104,9 @@ export async function runAgentCodex(
     })
 
     log('user', userMessage)
+    onProgress?.('🤖 Running codex CLI…')
     const prompt = buildPrompt(userMessage, history)
-    const response = await invokeCodexCli(prompt, ctx)
+    const response = await invokeCodexCli(prompt, ctx, onProgress)
     log('response', response)
 
     currentSpan().log({ output: response })

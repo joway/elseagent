@@ -10,7 +10,7 @@
 
 import { spawn } from 'node:child_process'
 import { traced, currentSpan } from 'braintrust'
-import type { HistoryMessage } from './agent.js'
+import type { HistoryMessage, ProgressFn } from './agent.js'
 import type { ToolContext } from './tools.js'
 import { log } from './logger.js'
 
@@ -66,6 +66,7 @@ export async function runAgentCli(
   userMessage: string,
   ctx: ToolContext,
   history: HistoryMessage[] = [],
+  onProgress?: ProgressFn,
 ): Promise<{ response: string; history: HistoryMessage[] }> {
   return traced(async () => {
     currentSpan().log({
@@ -74,6 +75,7 @@ export async function runAgentCli(
     })
 
     log('user', userMessage)
+    onProgress?.('🤖 Running claude CLI…')
     const prompt = buildPrompt(userMessage, history)
     const response = await invokeClaudeCli(prompt)
     log('response', response)
